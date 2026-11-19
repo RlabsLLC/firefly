@@ -8,6 +8,7 @@ import time
 import traceback
 import uuid
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Literal
 
@@ -27,8 +28,10 @@ app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 lock = threading.RLock()
 stop_event = threading.Event()
 state = {
-    "phase": "idle", "message": "Ready", "step": 0, "total": 0,
-    "loss": None, "eta": None, "logs": [], "run": None, "artifact": None,
+    "phase": "starting", "message": "Studio API ready; initializing hardware detection",
+    "step": 0, "total": 0, "loss": None, "eta": None,
+    "logs": [f"{time.strftime('%H:%M:%S')}  Studio API ready; opening live log stream."],
+    "run": None, "artifact": None,
 }
 uploads = {}
 
@@ -39,13 +42,37 @@ def emit(message):
         state["logs"] = state["logs"][-1000:]
 
 
+@contextmanager
+def progress(message, interval=15):
+    emit(message)
+    finished = threading.Event()
+    started = time.monotonic()
+
+    def report():
+        while not finished.wait(interval):
+            emit(f"{message} (still running; {int(time.monotonic() - started)}s elapsed)")
+
+    reporter = threading.Thread(target=report, daemon=True)
+    reporter.start()
+    try:
+        yield
+    finally:
+        finished.set()
+        reporter.join(timeout=1)
+
+
 def snapshot():
     with lock:
         return {key: value for key, value in state.items() if key != "run"}
 
 
 def hardware():
-    import torch
+    emit("Detecting accelerator; importing PyTorch...")
+    try:
+        import torch
+    except ImportError as exc:
+        return {"kind": "cpu", "name": "CPU", "precision": "fp32", "cores": 1,
+                "free_gib": None, "total_gib": None, "warning": f"PyTorch unavailable: {exc}"}
     if torch.cuda.is_available():
         free, total = torch.cuda.mem_get_info(0)
         major, _ = torch.cuda.get_device_capability(0)
@@ -235,22 +262,29 @@ def preview(source: Source):
 
 def run_training(config, hw, run_dir):
     try:
-        import torch
-        from transformers import AutoModelForCausalLM, BitsAndBytesConfig, TrainerCallback
-        from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-        from trl import SFTConfig, SFTTrainer
+        emit("Training worker started.")
+        with progress("Importing PyTorch"):
+            import torch
+        with progress("Importing Transformers"):
+            from transformers import AutoModelForCausalLM, BitsAndBytesConfig, TrainerCallback
+        with progress("Importing PEFT"):
+            from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+        with progress("Importing TRL"):
+            from trl import SFTConfig, SFTTrainer
 
-        emit("Loading dataset and tokenizer...")
-        dataset = load_data(config)
+        with progress(f"Loading dataset ({config.dataset_id or 'uploaded file'})"):
+            dataset = load_data(config)
         if not len(dataset):
             raise ValueError("Dataset is empty.")
-        tokenizer = tokenizer_for(config)
+        with progress("Loading tokenizer"):
+            tokenizer = tokenizer_for(config)
         if tokenizer.pad_token is None:
             if tokenizer.eos_token is None:
                 raise ValueError("Tokenizer must have a pad or EOS token.")
             tokenizer.pad_token = tokenizer.eos_token
-        dataset = dataset.map(lambda row: {"text": formatted(row, tokenizer)},
-                              remove_columns=dataset.column_names, desc="Formatting")
+        with progress(f"Formatting {len(dataset)} dataset rows"):
+            dataset = dataset.map(lambda row: {"text": formatted(row, tokenizer)},
+                                  remove_columns=dataset.column_names, desc="Formatting")
         if stop_event.is_set():
             raise RuntimeError("Stopped before training began; no checkpoint was created.")
         dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[hw["precision"]]
@@ -266,7 +300,8 @@ def run_training(config, hw, run_dir):
                 bnb_4bit_compute_dtype=dtype)
             kwargs["device_map"] = {"": 0}
         emit(f"Loading {config.model} ({config.method}, {hw['precision']})...")
-        model = AutoModelForCausalLM.from_pretrained(config.model.strip(), **kwargs)
+        with progress(f"Loading model weights for {config.model}"):
+            model = AutoModelForCausalLM.from_pretrained(config.model.strip(), **kwargs)
         model.config.use_cache = False
         if config.method != "full":
             if config.method == "qlora":
@@ -317,10 +352,11 @@ def run_training(config, hw, run_dir):
             fp16=hw["precision"] == "fp16", bf16=hw["precision"] == "bf16",
             logging_steps=1, save_strategy="no", report_to="none",
             dataloader_num_workers=0, use_cpu=hw["kind"] == "cpu")
-        trainer = SFTTrainer(model=model, args=args, train_dataset=dataset,
-                             processing_class=tokenizer, callbacks=[Monitor()])
-        emit("Training started. Loss includes all tokens, including prompts.")
-        trainer.train()
+        with progress("Preparing trainer and tokenizing training data"):
+            trainer = SFTTrainer(model=model, args=args, train_dataset=dataset,
+                                 processing_class=tokenizer, callbacks=[Monitor()])
+        with progress("Training started; waiting for the first optimizer step"):
+            trainer.train()
         raw = run_dir / "raw"
         trainer.save_model(str(raw))
         tokenizer.save_pretrained(str(raw))
@@ -575,7 +611,8 @@ async function api(path,opts={}){
 const post=(path,data)=>api(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
 function error(e){$('message').textContent=e.message; $('terminal').textContent+='\nERROR: '+e.message}
 async function initialize(){
- try{const s=await api('status');hw=s.hardware;render(s);hardwareUI();inspectModel();stream()}
+ stream();
+ try{const s=await api('status');hw=s.hardware;render(s);hardwareUI();inspectModel()}
  catch(e){$('phase').textContent='OFFLINE';error(e)}
 }
 initialize();
