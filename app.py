@@ -1,5 +1,4 @@
 import gc
-import hmac
 import json
 import os
 import subprocess
@@ -12,7 +11,7 @@ import zipfile
 from pathlib import Path
 from typing import Literal
 
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, Response, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -21,9 +20,6 @@ ROOT.mkdir(parents=True, exist_ok=True)
 SESSION = ROOT / ("session-" + uuid.uuid4().hex)
 SESSION.mkdir(mode=0o700)
 os.environ["HF_HOME"] = str(SESSION / "hf-home")
-KEY = os.environ.get("STUDIO_KEY")
-if not KEY:
-    raise RuntimeError("Set STUDIO_KEY to a strong random secret before starting the server.")
 LLAMA = Path(os.environ.get("LLAMA_CPP", "/content/llama.cpp"))
 CONVERTER_PYTHON = os.environ.get("LLAMA_CONVERTER_PYTHON", sys.executable)
 
@@ -46,11 +42,6 @@ def emit(message):
 def snapshot():
     with lock:
         return {key: value for key, value in state.items() if key != "run"}
-
-
-def auth(authorization: str = Header(default="")):
-    if not hmac.compare_digest(authorization, "Bearer " + KEY):
-        raise HTTPException(401, "Invalid studio access key")
 
 
 def hardware():
@@ -170,19 +161,12 @@ def index():
     return HTML
 
 
-@app.post("/api/unlock")
-def unlock(response: Response, authorization: str = Header(default="")):
-    auth(authorization)
-    response.set_cookie("studio_key", KEY, httponly=True, secure=True, samesite="strict", path="/")
-    return {"ok": True}
-
-
-@app.get("/api/status", dependencies=[Depends(auth)])
+@app.get("/api/status")
 def status():
     return {"hardware": hardware(), **snapshot()}
 
 
-@app.get("/api/events", dependencies=[Depends(auth)])
+@app.get("/api/events")
 def events():
     def stream():
         while True:
@@ -192,7 +176,7 @@ def events():
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
-@app.post("/api/login", dependencies=[Depends(auth)])
+@app.post("/api/login")
 def login_hf(body: LoginRequest):
     from huggingface_hub import HfApi, login
     try:
@@ -204,7 +188,7 @@ def login_hf(body: LoginRequest):
     return {"username": user["name"]}
 
 
-@app.get("/api/model", dependencies=[Depends(auth)])
+@app.get("/api/model")
 def model_info(model: str):
     from huggingface_hub import HfApi
     try:
@@ -215,7 +199,7 @@ def model_info(model: str):
         raise HTTPException(400, f"Could not inspect model metadata: {exc}") from exc
 
 
-@app.post("/api/upload", dependencies=[Depends(auth)])
+@app.post("/api/upload")
 async def upload(file: UploadFile = File(...)):
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in (".json", ".jsonl", ".parquet"):
@@ -239,7 +223,7 @@ async def upload(file: UploadFile = File(...)):
     return {"upload_id": ident, "filename": file.filename}
 
 
-@app.post("/api/preview", dependencies=[Depends(auth)])
+@app.post("/api/preview")
 def preview(source: Source):
     try:
         dataset = load_data(source)
@@ -355,7 +339,7 @@ def run_training(config, hw, run_dir):
         fail(exc)
 
 
-@app.post("/api/train", dependencies=[Depends(auth)])
+@app.post("/api/train")
 def train(config: Training):
     hw = hardware()
     if config.method == "qlora" and hw["kind"] != "cuda":
@@ -377,7 +361,7 @@ def train(config: Training):
     return {"ok": True}
 
 
-@app.post("/api/stop", dependencies=[Depends(auth)])
+@app.post("/api/stop")
 def stop():
     with lock:
         if state["phase"] != "training":
@@ -508,7 +492,7 @@ def run_export(request, run):
         fail(exc)
 
 
-@app.post("/api/export", dependencies=[Depends(auth)])
+@app.post("/api/export")
 def export(body: ExportRequest):
     with lock:
         run = state["run"]
@@ -521,9 +505,7 @@ def export(body: ExportRequest):
 
 
 @app.get("/api/download")
-def download(request: Request):
-    if not hmac.compare_digest(request.cookies.get("studio_key", ""), KEY):
-        raise HTTPException(401, "Unlock the studio first.")
+def download():
     with lock:
         artifact = state["artifact"]
     if not artifact or not Path(artifact).is_file():
@@ -547,10 +529,9 @@ label{display:block;color:#a8b2c5;font-size:12px;font-weight:600;margin-bottom:6
 </style></head>
 <body><header class="border-b border-slate-800 bg-[#0d111a]"><div class="max-w-[1500px] mx-auto px-6 py-5 flex flex-wrap items-center justify-between gap-3">
 <div><div class="text-xl font-bold tracking-tight"><span class="text-violet-400">✦</span> FIREFLY <span class="text-slate-500 font-normal">/ fine-tuning studio</span></div><div class="text-xs text-slate-500 mt-1">Single-session model lab · Colab edition</div></div>
-<div class="flex gap-2"><span id="hardware" class="tag">Detecting hardware</span><span id="phase" class="tag">LOCKED</span></div></div></header>
+<div class="flex gap-2"><span id="hardware" class="tag">Detecting hardware</span><span id="phase" class="tag">CONNECTING</span></div></div></header>
 <main class="max-w-[1500px] mx-auto px-6 py-7">
-<div id="unlockPanel" class="card max-w-xl mx-auto mt-10"><h2 class="text-lg font-semibold">Unlock your studio</h2><p class="text-sm text-slate-400 my-3">Paste the access key printed by Cell 3. Keep the key and proxy URL private.</p><label>Studio access key</label><input id="accessKey" type="password" autocomplete="off"><button id="unlock" class="btn primary mt-4">Unlock studio</button><div id="unlockError" class="text-red-400 text-sm mt-3"></div></div>
-<div id="studio" class="hidden"><div id="warning" class="hidden mb-5 rounded-xl border border-amber-700/70 bg-amber-950/30 px-4 py-3 text-sm text-amber-200"></div>
+<div id="studio"><div id="warning" class="hidden mb-5 rounded-xl border border-amber-700/70 bg-amber-950/30 px-4 py-3 text-sm text-amber-200"></div>
 <div class="grid grid-cols-1 xl:grid-cols-12 gap-5">
 <section class="xl:col-span-4 space-y-5">
 <div class="card"><div class="flex items-center justify-between mb-4"><h2 class="font-semibold">01 <span class="text-slate-400 ml-2">Model & access</span></h2><span id="hfUser" class="tag">Not connected</span></div>
@@ -581,26 +562,23 @@ label{display:block;color:#a8b2c5;font-size:12px;font-weight:600;margin-bottom:6
 <div class="grid grid-cols-3 gap-3 mt-5"><div><div class="text-xs text-slate-500">STEP</div><div id="step" class="text-xl font-semibold mt-1">0 / —</div></div><div><div class="text-xs text-slate-500">LOSS</div><div id="loss" class="text-xl font-semibold mt-1">—</div></div><div><div class="text-xs text-slate-500">ETA</div><div id="eta" class="text-xl font-semibold mt-1">—</div></div></div>
 <div class="h-1.5 bg-slate-800 rounded-full mt-5 overflow-hidden"><div id="progress" class="h-full bg-violet-400 transition-all" style="width:0%"></div></div><p id="message" class="text-xs text-slate-400 mt-2">Waiting for a job</p>
 <div class="flex justify-between items-center mt-7 mb-2"><span class="text-xs uppercase tracking-wider text-slate-500">Terminal</span><span class="text-xs text-slate-600 mono">session.log</span></div><pre id="terminal" class="mono bg-[#080b11] rounded-lg border border-slate-800 p-4 text-xs text-slate-300 whitespace-pre-wrap break-words overflow-auto h-[450px] xl:h-[680px]"></pre></div></section>
-</div><footer class="text-xs text-slate-600 mt-6">Artifacts and the Hugging Face login exist only in this runtime. Back up downloads before disconnecting. Expose the service only to trusted users.</footer></div></main>
+</div><footer class="text-xs text-slate-600 mt-6">Artifacts and the Hugging Face login exist only in this runtime. Back up downloads before disconnecting. This studio has no built-in authentication; use a private, authenticated proxy and expose it only to trusted users.</footer></div></main>
 <script>
 const $=id=>document.getElementById(id);
 const base=new URL('api/',location.href.endsWith('/')?location.href:location.href+'/');
-let key=sessionStorage.getItem('studioKey')||'', uploaded='', params=null, hw=null, phase='idle', streamStarted=false;
+let uploaded='', params=null, hw=null, phase='idle';
 async function api(path,opts={}){
-  opts.headers={...(opts.headers||{}),Authorization:'Bearer '+key};
   const res=await fetch(new URL(path,base),opts);
   if(!res.ok){let msg;try{msg=(await res.json()).detail}catch{msg=await res.text()}throw Error(typeof msg==='string'?msg:JSON.stringify(msg))}
   return res.json();
 }
 const post=(path,data)=>api(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
 function error(e){$('message').textContent=e.message; $('terminal').textContent+='\nERROR: '+e.message}
-async function unlock(){
- try{key=$('accessKey').value||key;await post('unlock',{});const s=await api('status');sessionStorage.setItem('studioKey',key);
- $('unlockPanel').classList.add('hidden');$('studio').classList.remove('hidden');hw=s.hardware;render(s);hardwareUI();inspectModel();if(!streamStarted){streamStarted=true;stream()}}
- catch(e){$('unlockError').textContent=e.message}
+async function initialize(){
+ try{const s=await api('status');hw=s.hardware;render(s);hardwareUI();inspectModel();stream()}
+ catch(e){$('phase').textContent='OFFLINE';error(e)}
 }
-$('unlock').onclick=unlock;
-if(key)unlock();
+initialize();
 function source(){return {model:$('model').value,trust_remote_code:$('trust').checked,dataset_id:$('datasetId').value.trim(),upload_id:uploaded,split:$('split').value}}
 function hardwareUI(){
  $('hardware').textContent=hw.name+' · '+hw.precision.toUpperCase()+(hw.total_gib?' · '+hw.free_gib+'/'+hw.total_gib+' GiB free':'')+(hw.kind==='tpu'?' · '+hw.cores+' cores available':'');
@@ -644,7 +622,7 @@ function render(s){
  let t=$('terminal'),follow=t.scrollTop+t.clientHeight>=t.scrollHeight-40;t.textContent=s.logs.join('\n');if(follow)t.scrollTop=t.scrollHeight;
 }
 async function stream(){
- while(true){try{let response=await fetch(new URL('events',base),{headers:{Authorization:'Bearer '+key}});if(!response.ok)throw Error('Stream connection failed');
+ while(true){try{let response=await fetch(new URL('events',base));if(!response.ok)throw Error('Stream connection failed');
  let reader=response.body.getReader(),decoder=new TextDecoder(),buffer='';
  while(true){let {value,done}=await reader.read();if(done)break;buffer+=decoder.decode(value,{stream:true});let i;while((i=buffer.indexOf('\n\n'))>=0){let event=buffer.slice(0,i);buffer=buffer.slice(i+2);if(event.startsWith('data: '))render(JSON.parse(event.slice(6)))}}}
  catch(e){$('message').textContent='Connection interrupted; reconnecting…'}await new Promise(r=>setTimeout(r,2000))}
