@@ -16,7 +16,14 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-ROOT = Path(os.environ.get("STUDIO_ROOT", "/content/llm-studio"))
+def default_root():
+    content = Path("/content")
+    if content.is_dir() and os.access(content, os.W_OK):
+        return content / "llm-studio"
+    return Path.home() / ".cache" / "firefly-studio"
+
+
+ROOT = Path(os.environ.get("STUDIO_ROOT") or default_root())
 ROOT.mkdir(parents=True, exist_ok=True)
 SESSION = ROOT / ("session-" + uuid.uuid4().hex)
 SESSION.mkdir(mode=0o700)
@@ -551,7 +558,7 @@ def download():
 
 HTML = r'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Firefly Studio</title><script src="https://cdn.tailwindcss.com"></script>
+<title>Firefly Studio</title><script src="https://cdn.tailwindcss.com" defer></script>
 <style>
 body{background:#090c12;color:#e5e9f2;font-family:Inter,ui-sans-serif,system-ui,sans-serif}
 .card{background:#111620;border:1px solid #252c3b;border-radius:14px;padding:22px}
@@ -665,3 +672,9 @@ async function stream(){
  catch(e){$('message').textContent='Connection interrupted; reconnecting…'}await new Promise(r=>setTimeout(r,2000))}
 }
 </script></body></html>'''
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=5000, log_level="info")
